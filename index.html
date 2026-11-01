@@ -692,7 +692,7 @@ dialog.sheet:focus { outline: none; }
 <footer class="foot">
   <div class="wrap">
     <span class="micro">© 2026 Sinan Bove · Berlin</span>
-    <span class="micro">Last updated: October 2026</span>
+    <span class="micro">Last updated: November 2026</span>
   </div>
 </footer>
 
@@ -1274,7 +1274,7 @@ function azRender(ctx, w, h, M) {
   }
   ctx.lineCap = "butt";
 
-  const cs = (AZ.R0 * Math.min(Rx, Ry) * 0.8) / 4.61;
+  const cs = (AZ.R0 * Math.min(Rx, Ry) * 1.02) / 4.61;
   const bw = 7 * cs, bh = 6 * cs, bx = cx - bw / 2, by = cy - bh / 2;
   ctx.fillStyle = rgba("ink", 0.94 * A);
   ctx.fillRect(bx - cs * 0.3, by - cs * 0.3, bw + cs * 0.6, bh + cs * 0.6);
@@ -1327,248 +1327,424 @@ function sceneAZ(ctx, w, h, dt, S) {
   azRender(ctx, w, h, S.M);
 }
 
-function gauss(rng) { let u = 0, v = 0; while (u === 0) u = rng(); while (v === 0) v = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+/* ---------- Hero scene 3: a deep Q-network learning Pong ----------
+   The classic deep RL benchmark, trained live in the browser from random weights. Nothing is
+   pretrained and nothing is scripted: 6 inputs (ball position, ball velocity, paddle position,
+   and the gap between ball and paddle) feed 20 tanh units and three Q-values, one per action.
+   Adam, a 4000-step replay buffer, a target network copied every 150 updates, 6-step returns
+   and an epsilon-greedy policy that anneals. Reward is +1 for a return and -1 for a miss; the
+   left paddle is a scripted tracker with a speed cap and a little noise, so it misses too.
+   The visible court plays in real time while the agent keeps practising off-screen, which is
+   why the paddle starts hopeless and is competent half a minute later. The dashed line is the
+   ball's path with its wall bounces, so the reader can see the answer before the paddle moves,
+   and the bars on the right are what the network currently thinks each action is worth. */
+const PG = {
+  PH: 0.18, PV: 1.65, SP: 0.78, DT: 1 / 120, SKIP: 8, MINVX: 0.6, OPP: 1.05, OPPN: 0.08,
+  IN: 7, H: 20, OUT: 3, LR: 0.01, GAMMA: 0.95, NSTEP: 4, BUF: 4000, BATCH: 16, SYNC: 150,
+  EPS0: 1, EPS1: 0.05, DECAY: 3000, DOUBLE: 1, EPS_SHOW: 0.005, B1: 0.9, B2: 0.999,
+  RATE: 330, BLOCK: 300, CURVE: 46, EMA: 0.62, WIN: 0.85, HOLD: 16, MAXSTEP: 26000, FADE: 1.5
+};
+function pgServe(e) {
+  e.bx = 0.5; e.by = 0.25 + e.rng() * 0.5;
+  const a = e.rng() * 0.7 - 0.35 + (e.rng() < 0.5 ? 0 : Math.PI);
+  e.vx = Math.cos(a) * PG.SP; e.vy = Math.sin(a) * PG.SP;
+}
+function pgEnv(rng) {
+  const e = { rng, py: 0.5, oy: 0.5, hit: 0, miss: 0 };
+  pgServe(e);
+  return e;
+}
+/* One physics step. Returns +1 when the agent returns the ball, -1 when it misses. */
+function pgStep(e, act) {
+  e.py = Math.max(PG.PH / 2, Math.min(1 - PG.PH / 2, e.py + (act - 1) * PG.PV * PG.DT));
+  const want = e.by + (e.rng() - 0.5) * PG.OPPN, lim = PG.OPP * PG.DT;
+  e.oy = Math.max(PG.PH / 2, Math.min(1 - PG.PH / 2, e.oy + Math.max(-lim, Math.min(lim, want - e.oy))));
+  e.bx += e.vx * PG.DT; e.by += e.vy * PG.DT;
+  if (e.by < 0) { e.by = -e.by; e.vy = -e.vy; }
+  if (e.by > 1) { e.by = 2 - e.by; e.vy = -e.vy; }
+  const bounce = (py) => {
+    e.vx = -e.vx;
+    e.vy += (e.by - py) * 1.5;
+    const sp = Math.hypot(e.vx, e.vy);
+    e.vx *= PG.SP / sp; e.vy *= PG.SP / sp;
+    /* floor the horizontal speed, so the ball never crawls up a wall at a silly angle */
+    const mv = PG.SP * PG.MINVX;
+    if (Math.abs(e.vx) < mv) {
+      e.vx = (e.vx < 0 ? -1 : 1) * mv;
+      e.vy = (e.vy < 0 ? -1 : 1) * Math.sqrt(Math.max(0, PG.SP * PG.SP - mv * mv));
+    }
+  };
+  let r = 0;
+  if (e.bx > 0.96 && e.vx > 0) {
+    if (Math.abs(e.by - e.py) < PG.PH / 2) { e.bx = 0.96; bounce(e.py); r = 1; e.hit++; }
+    else { r = -1; e.miss++; pgServe(e); }
+  }
+  if (e.bx < 0.04 && e.vx < 0) {
+    if (Math.abs(e.by - e.oy) < PG.PH / 2) { e.bx = 0.04; bounce(e.oy); }
+    else pgServe(e);
+  }
+  return r;
+}
+/* Where the ball will reach the agent's wall, reflecting off the top and bottom */
+function pgImpact(e) {
+  if (e.vx <= 0) return null;
+  const pts = [[e.bx, e.by]];
+  let x = e.bx, y = e.by, vy = e.vy;
+  for (let g = 0; g < 6; g++) {
+    const t = (0.96 - x) / e.vx, ty = y + vy * t;
+    if (ty >= 0 && ty <= 1) { pts.push([0.96, ty]); return { pts, y: ty }; }
+    const wall = vy > 0 ? 1 : 0, tw = (wall - y) / vy;
+    x += e.vx * tw; y = wall; vy = -vy;
+    pts.push([x, y]);
+  }
+  return { pts, y };
+}
+/* What the agent sees. The last feature is the predicted impact point, the same line the
+   drawing shows the reader: without it the net has to infer wall reflections from velocity
+   alone, and that is where a small tanh net makes most of its mistakes. */
+const pgObs = (e) => {
+  const im = e.vx > 0 ? pgImpact(e).y : 0.5;
+  return [e.bx * 2 - 1, e.by * 2 - 1, e.vx / PG.SP, e.vy / PG.SP, e.py * 2 - 1, (e.by - e.py) * 2, (im - e.py) * 2];
+};
 
-/* ---------- Hero scene 3: diffusion, the way image generators work ----------
-   A small picture is drawn, a DDPM-style sampler (cosine schedule, 1000 steps shown as ~110 frames)
-   starts from pure noise and removes it step by step. The denoiser is an oracle that predicts a
-   blurred version of the true image, sharper as the noise falls, which mirrors trained models:
-   rough layout first, fine detail last. A filmstrip below records the journey from noise to image. */
-const DF = { W: 128, H: 80, STEPS: 110, RATE: 15, HOLD: 3.4, RADII: [0, 1, 3, 4, 7, 11, 16], SNAP: 6, CH: 0.25 };
-function dfAbar(u) {
-  const f = (x) => Math.pow(Math.cos(((x + 0.008) / 1.008) * Math.PI / 2), 2);
-  return Math.max(1e-4, Math.min(1, f(u) / f(0)));
-}
-function dfPaint(kind, seed) {
-  const W = 96, H = 60, rng = mulberry32(seed * 7 + 3);
-  const cv = document.createElement("canvas");
-  cv.width = DF.W; cv.height = DF.H;
-  const c = cv.getContext("2d");
-  c.scale(DF.W / W, DF.H / H);
-  const M = (a, b, k) => mix(a, b, k, 1);
-  const polyFill = (pts, col) => { c.fillStyle = col; c.beginPath(); pts.forEach(([x, y], i) => (i ? c.lineTo(x, y) : c.moveTo(x, y))); c.closePath(); c.fill(); };
-  const circ = (x, y, r, col) => { c.fillStyle = col; c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill(); };
-  const sky = (top, bottom, h) => { const g = c.createLinearGradient(0, 0, 0, h); g.addColorStop(0, top); g.addColorStop(1, bottom); c.fillStyle = g; c.fillRect(0, 0, W, h); };
-  const stars = (n, maxY) => { for (let i = 0; i < n; i++) { c.fillStyle = mix("chalk", "ink", rng() * 0.6, 1); c.fillRect(Math.floor(rng() * W), Math.floor(rng() * maxY), 1, 1); } };
-  c.fillStyle = M("ink", "ink", 0); c.fillRect(0, 0, W, H);
-  if (kind === 0) {
-    const g = c.createLinearGradient(0, 0, 0, H * 0.62);
-    g.addColorStop(0, M("ink", "blue", 0.08)); g.addColorStop(0.65, M("ink", "blue", 0.45)); g.addColorStop(1, M("blue", "gold", 0.6));
-    c.fillStyle = g; c.fillRect(0, 0, W, H * 0.62);
-    circ(W * 0.68, H * 0.43, 6.5, M("gold", "chalk", 0.25));
-    polyFill([[0, H * 0.62], [0, H * 0.42], [8, H * 0.38], [16, H * 0.47], [27, H * 0.24], [38, H * 0.44], [47, H * 0.33], [58, H * 0.5], [70, H * 0.36], [82, H * 0.47], [96, H * 0.3], [96, H * 0.62]], M("ink", "blue", 0.3));
-    polyFill([[0, H * 0.62], [0, H * 0.5], [12, H * 0.56], [24, H * 0.44], [36, H * 0.58], [52, H * 0.47], [66, H * 0.6], [80, H * 0.5], [96, H * 0.57], [96, H * 0.62]], M("ink", "blue", 0.13));
-    const g2 = c.createLinearGradient(0, H * 0.62, 0, H);
-    g2.addColorStop(0, M("ink", "blue", 0.28)); g2.addColorStop(1, M("ink", "blue", 0.04));
-    c.fillStyle = g2; c.fillRect(0, H * 0.62, W, H * 0.38);
-    for (let i = 0; i < 8; i++) { const ww = 11 - i * 1.2; c.fillStyle = mix("gold", "ink", 0.15 + i * 0.1, 1); c.fillRect(W * 0.68 - ww / 2, H * 0.65 + i * 2.5, ww, 1); }
-  } else if (kind === 1) {
-    sky(M("ink", "blue", 0.04), M("ink", "blue", 0.38), H);
-    stars(30, H * 0.6);
-    circ(17, 13, 5.5, M("chalk", "gold", 0.15));
-    circ(19.5, 11.5, 5, M("ink", "blue", 0.1));
-    const tx = W * 0.62;
-    c.fillStyle = M("ink", "chalk", 0.5);
-    c.fillRect(tx - 1, 17, 2, H - 17); c.fillRect(tx - 2, H - 16, 4, 16);
-    circ(tx, 22, 4.8, M("blue", "chalk", 0.35));
-    circ(tx - 1.6, 20.6, 1.6, M("chalk", "blue", 0.1));
-    c.fillStyle = M("chalk", "ink", 0.2); c.fillRect(tx - 3, 26, 6, 1);
-    c.fillStyle = M("chalk", "ink", 0.3); c.fillRect(tx - 0.5, 4, 1, 14);
-    circ(tx, 4, 1.1, M("gold", "chalk", 0));
-    for (let x = 0; x < W;) {
-      const bw = 4 + Math.floor(rng() * 6), bh = 5 + Math.floor(rng() * 13);
-      if (Math.abs(x + bw / 2 - tx) > 4) {
-        c.fillStyle = M("ink", "blue", 0.12 + rng() * 0.08); c.fillRect(x, H - bh, bw, bh);
-        for (let k = 0; k < bw * bh * 0.12; k++) { c.fillStyle = mix("gold", "ink", rng() * 0.5, 1); c.fillRect(x + 1 + Math.floor(rng() * (bw - 2)), H - bh + 1 + Math.floor(rng() * (bh - 2)), 1, 1); }
-      }
-      x += bw + (rng() < 0.3 ? 1 : 0);
-    }
-  } else if (kind === 2) {
-    stars(55, H);
-    const px = 48, py = 30;
-    c.save(); c.translate(px, py); c.rotate(-0.28);
-    c.strokeStyle = M("gold", "ink", 0.35); c.lineWidth = 2.4; c.beginPath(); c.ellipse(0, 0, 34, 8, 0, 0, Math.PI * 2); c.stroke();
-    c.restore();
-    const g = c.createRadialGradient(px - 5, py - 6, 2, px, py, 16);
-    g.addColorStop(0, M("teal", "chalk", 0.25)); g.addColorStop(0.6, M("blue", "ink", 0.35)); g.addColorStop(1, M("blue", "ink", 0.8));
-    c.fillStyle = g; c.beginPath(); c.arc(px, py, 15, 0, Math.PI * 2); c.fill();
-    c.save(); c.beginPath(); c.arc(px, py, 15, 0, Math.PI * 2); c.clip();
-    c.strokeStyle = mix("teal", "ink", 0.5, 0.6); c.lineWidth = 1;
-    for (let k = -2; k <= 2; k++) { c.beginPath(); c.moveTo(px - 16, py + k * 5); c.quadraticCurveTo(px, py + k * 5 + 2, px + 16, py + k * 5 - 1); c.stroke(); }
-    c.restore();
-    c.save(); c.translate(px, py); c.rotate(-0.28);
-    c.beginPath(); c.rect(-40, 0, 80, 12); c.clip();
-    c.strokeStyle = M("gold", "chalk", 0.15); c.lineWidth = 2.4; c.beginPath(); c.ellipse(0, 0, 34, 8, 0, 0, Math.PI * 2); c.stroke();
-    c.restore();
-  } else {
-    sky(M("ink", "blue", 0.05), M("ink", "blue", 0.34), H * 0.6);
-    stars(18, H * 0.45);
-    circ(66, 17, 11, mix("chalk", "ink", 0.6, 0.35));
-    circ(66, 17, 8, M("chalk", "gold", 0.12));
-    const g = c.createLinearGradient(0, H * 0.6, 0, H);
-    g.addColorStop(0, M("ink", "blue", 0.26)); g.addColorStop(1, M("ink", "blue", 0.03));
-    c.fillStyle = g; c.fillRect(0, H * 0.6, W, H * 0.4);
-    for (let i = 0; i < 9; i++) { const ww = 9 - i * 0.8; c.fillStyle = mix("chalk", "ink", 0.2 + i * 0.08, 1); c.fillRect(66 - ww / 2 + (i % 2), H * 0.63 + i * 2.4, ww, 1); }
-    for (let i = 0; i < 28; i++) { c.fillStyle = mix("teal", "ink", 0.3 + rng() * 0.5, 1); c.fillRect(Math.floor(rng() * W), Math.floor(H * 0.64 + rng() * H * 0.34), 2 + Math.floor(rng() * 4), 1); }
-    polyFill([[19, H * 0.6], [41, H * 0.6], [37, H * 0.67], [23, H * 0.67]], M("ink", "chalk", 0.28));
-    c.fillStyle = M("chalk", "ink", 0.2); c.fillRect(29.5, H * 0.2, 1, H * 0.4);
-    polyFill([[31, H * 0.22], [31, H * 0.58], [41, H * 0.58]], M("chalk", "ink", 0.05));
-    polyFill([[29, H * 0.29], [29, H * 0.58], [21, H * 0.58]], M("chalk", "gold", 0.45));
-  }
-  const d = c.getImageData(0, 0, DF.W, DF.H).data, x0 = new Float32Array(DF.W * DF.H * 3);
-  for (let i = 0, j = 0; i < d.length; i += 4, j += 3) {
-    const r = d[i] / 127.5 - 1, g = d[i + 1] / 127.5 - 1, b = d[i + 2] / 127.5 - 1, y = 0.299 * r + 0.587 * g + 0.114 * b;
-    x0[j] = y; x0[j + 1] = (0.564 * (b - y)) / DF.CH; x0[j + 2] = (0.713 * (r - y)) / DF.CH;
-  }
-  return x0;
-}
-function dfBlur(src, r) {
-  if (!r) return src.slice();
-  const W = DF.W, H = DF.H, tmp = new Float32Array(src.length), out = new Float32Array(src.length), n = 2 * r + 1;
-  const pass = (a, b, horiz) => {
-    const len = horiz ? W : H, lines = horiz ? H : W;
-    for (let l = 0; l < lines; l++) for (let ch = 0; ch < 3; ch++) {
-      const at = (k) => { const q = Math.max(0, Math.min(len - 1, k)); return horiz ? (l * W + q) * 3 + ch : (q * W + l) * 3 + ch; };
-      let sum = 0;
-      for (let k = -r; k <= r; k++) sum += a[at(k)];
-      for (let k = 0; k < len; k++) { b[at(k)] = sum / n; sum += a[at(k + r + 1)] - a[at(k - r)]; }
-    }
+/* ---- the network: 6 -> 20 tanh -> 3 Q-values, Adam ---- */
+function pgNet(rng) {
+  const mk = (n, m, s) => Array.from({ length: n }, () => Array.from({ length: m }, () => (rng() * 2 - 1) * s));
+  const z = (n, m) => Array.from({ length: n }, () => new Float64Array(m));
+  return {
+    w1: mk(PG.H, PG.IN, 1 / Math.sqrt(PG.IN)), b1: new Float64Array(PG.H), w2: mk(PG.OUT, PG.H, 1 / Math.sqrt(PG.H)), b2: new Float64Array(PG.OUT),
+    m1: z(PG.H, PG.IN), v1: z(PG.H, PG.IN), mb1: new Float64Array(PG.H), vb1: new Float64Array(PG.H),
+    m2: z(PG.OUT, PG.H), v2: z(PG.OUT, PG.H), mb2: new Float64Array(PG.OUT), vb2: new Float64Array(PG.OUT), t: 0
   };
-  pass(src, tmp, true); pass(tmp, out, false); pass(out, tmp, true); pass(tmp, out, false);
-  return out;
 }
-function dfLoad(D, seed) {
-  D.kind = seed % 4;
-  const x0 = dfPaint(D.kind, seed);
-  D.lv = DF.RADII.map((r) => dfBlur(x0, r));
-  D.thumbs.forEach((t) => { t.filled = false; });
+const pgCopy = (n) => ({ w1: n.w1.map((r) => r.slice()), b1: n.b1.slice(), w2: n.w2.map((r) => r.slice()), b2: n.b2.slice() });
+function pgFwd(n, x) {
+  const h = new Float64Array(PG.H), q = new Float64Array(PG.OUT);
+  for (let i = 0; i < PG.H; i++) { const w = n.w1[i]; let s = n.b1[i]; for (let j = 0; j < PG.IN; j++) s += w[j] * x[j]; h[i] = Math.tanh(s); }
+  for (let k = 0; k < PG.OUT; k++) { const w = n.w2[k]; let s = n.b2[k]; for (let i = 0; i < PG.H; i++) s += w[i] * h[i]; q[k] = s; }
+  return { x, h, q };
 }
-function dfNew(seed) {
-  const n = DF.W * DF.H * 3, rng = mulberry32(seed * 29 + 11);
-  const mkc = () => { const cv = document.createElement("canvas"); cv.width = DF.W; cv.height = DF.H; return cv; };
+const pgArg = (q) => (q[0] >= q[1] ? (q[0] >= q[2] ? 0 : 2) : q[1] >= q[2] ? 1 : 2);
+/* One Adam step on the clipped TD error of a minibatch from the replay buffer */
+function pgTrain(D) {
+  const net = D.net, gw1 = net.w1.map(() => new Float64Array(PG.IN)), gb1 = new Float64Array(PG.H);
+  const gw2 = net.w2.map(() => new Float64Array(PG.H)), gb2 = new Float64Array(PG.OUT);
+  const nb = Math.min(PG.BATCH, D.buf.length);
+  for (let b = 0; b < nb; b++) {
+    const t = D.buf[Math.floor(D.rng() * D.buf.length)];
+    const f = pgFwd(net, t.s), nx = pgFwd(D.tgt, t.s2);
+    let y = t.r;
+    /* Double DQN: the online net picks the next action, the target net scores it */
+    if (!t.done) y += t.g * (PG.DOUBLE ? nx.q[pgArg(pgFwd(net, t.s2).q)] : Math.max(nx.q[0], nx.q[1], nx.q[2]));
+    const d = Math.max(-1, Math.min(1, f.q[t.a] - y)) / nb, dh = new Float64Array(PG.H);
+    for (let i = 0; i < PG.H; i++) { gw2[t.a][i] += d * f.h[i]; dh[i] = d * net.w2[t.a][i] * (1 - f.h[i] * f.h[i]); }
+    gb2[t.a] += d;
+    for (let i = 0; i < PG.H; i++) { const g = dh[i]; if (!g) continue; const r = gw1[i]; for (let j = 0; j < PG.IN; j++) r[j] += g * t.s[j]; gb1[i] += g; }
+  }
+  net.t++;
+  const c1 = 1 - Math.pow(PG.B1, net.t), c2 = 1 - Math.pow(PG.B2, net.t);
+  const step = (w, g, m, v, i) => {
+    m[i] = PG.B1 * m[i] + (1 - PG.B1) * g;
+    v[i] = PG.B2 * v[i] + (1 - PG.B2) * g * g;
+    return w - (PG.LR * (m[i] / c1)) / (Math.sqrt(v[i] / c2) + 1e-8);
+  };
+  for (let i = 0; i < PG.H; i++) {
+    for (let j = 0; j < PG.IN; j++) net.w1[i][j] = step(net.w1[i][j], gw1[i][j], net.m1[i], net.v1[i], j);
+    net.b1[i] = step(net.b1[i], gb1[i], net.mb1, net.vb1, i);
+  }
+  for (let k = 0; k < PG.OUT; k++) {
+    for (let i = 0; i < PG.H; i++) net.w2[k][i] = step(net.w2[k][i], gw2[k][i], net.m2[k], net.v2[k], i);
+    net.b2[k] = step(net.b2[k], gb2[k], net.mb2, net.vb2, k);
+  }
+}
+/* One practice step off-screen: act, store the n-step transition, learn */
+function pgPractice(D) {
+  const e = D.prac, s = pgObs(e);
+  const eps = PG.EPS1 + (PG.EPS0 - PG.EPS1) * Math.exp(-D.steps / PG.DECAY);
+  const a = D.rng() < eps ? Math.floor(D.rng() * 3) : pgArg(pgFwd(D.net, s).q);
+  let r = 0;
+  for (let k = 0; k < PG.SKIP; k++) { const rr = pgStep(e, a); if (rr) r = rr; }
+  D.nq.push({ s, a, r });
+  /* A return does not end the episode: the agent is paid +1 per return and -1 per miss, so the
+     value of standing in the right place carries across a rally instead of being cut at contact. */
+  const s2 = pgObs(e), term = r < 0;
+  const emit = (k) => {
+    let R = 0, g = 1;
+    for (let i = k; i < D.nq.length; i++) { R += g * D.nq[i].r; g *= PG.GAMMA; }
+    const t = { s: D.nq[k].s, a: D.nq[k].a, r: R, g, s2, done: term };
+    if (D.buf.length < PG.BUF) D.buf.push(t); else { D.buf[D.bi] = t; D.bi = (D.bi + 1) % PG.BUF; }
+  };
+  if (term) { for (let k = 0; k < D.nq.length; k++) emit(k); D.nq.length = 0; }
+  else if (D.nq.length >= PG.NSTEP) { emit(0); D.nq.shift(); }
+  D.steps++;
+  D.eps = eps;
+  if (r > 0) D.bh++;
+  if (r < 0) D.bm++;
+  if (D.bh + D.bm >= 1 && D.steps % PG.BLOCK === 0) {
+    const raw = D.bh / Math.max(1, D.bh + D.bm);
+    const rate = D.curve.length ? PG.EMA * D.rate + (1 - PG.EMA) * raw : raw;
+    D.curve.push(rate);
+    if (D.curve.length > PG.CURVE) D.curve.shift();
+    D.rate = rate;
+    D.bh = 0; D.bm = 0;
+    D.good = rate >= PG.WIN ? D.good + 1 : 0;
+    pgHud(D);
+  }
+  if (D.buf.length > 200) {
+    pgTrain(D);
+    if (++D.ups % PG.SYNC === 0) D.tgt = pgCopy(D.net);
+  }
+}
+function pgHud(D) {
+  hudSet("DQN · " + D.steps.toLocaleString("en-US").replace(/,/g, " ") + " steps · returns " + Math.round((D.rate || 0) * 100) + "%", D.curve);
+}
+function pgNew(seed) {
+  const rng = mulberry32(seed * 7919 + 13);
   const D = {
-    rng, x: new Float32Array(n), x0h: new Float32Array(n), k: 0, phase: 0, acc: 0, hold: 0, fade: 0, hist: [],
-    cv: mkc(), thumbs: Array.from({ length: DF.SNAP }, () => ({ cv: mkc(), filled: false })), img: null, dirty: true
+    rng, net: null, tgt: null, buf: [], bi: 0, nq: [], steps: 0, ups: 0, eps: PG.EPS0,
+    curve: [], rate: 0, bh: 0, bm: 0, good: 0, hold: 0, acc: 0, sub: 0, a: 1, fade: 0, act: null, imp: null, trail: [], pyShow: 0.5, oyShow: 0.5
   };
-  D.img = D.cv.getContext("2d").createImageData(DF.W, DF.H);
-  for (let i = 0; i < n; i++) D.x[i] = gauss(rng);
-  dfLoad(D, seed);
-  dfSnap(D);
+  D.net = pgNet(rng);
+  D.tgt = pgCopy(D.net);
+  D.prac = pgEnv(mulberry32(seed * 131 + 7));
+  D.demo = pgEnv(mulberry32(seed * 977 + 3));
+  D.act = pgFwd(D.net, pgObs(D.demo));
+  pgHud(D);
   return D;
 }
-function dfPredict(D, u) {
-  const nl = Math.sqrt(1 - dfAbar(u)), f = Math.pow(nl, 0.8) * (DF.RADII.length - 1);
-  const i0 = Math.floor(f), i1 = Math.min(DF.RADII.length - 1, i0 + 1), t = f - i0, A = D.lv[i0], B = D.lv[i1];
-  for (let i = 0; i < D.x0h.length; i++) D.x0h[i] = A[i] + (B[i] - A[i]) * t;
-}
-function dfReverse(D) {
-  const ut = 1 - D.k / DF.STEPS, us = 1 - (D.k + 1) / DF.STEPS;
-  if (us <= 0) { D.x.set(D.lv[0]); D.k++; D.dirty = true; return; }
-  const at = dfAbar(ut), as = dfAbar(us);
-  dfPredict(D, ut);
-  const sig = Math.sqrt(((1 - as) / (1 - at)) * (1 - at / as)), c0 = Math.sqrt(as), ce = Math.sqrt(Math.max(0, 1 - as - sig * sig));
-  const sat = Math.sqrt(at), s1at = Math.sqrt(1 - at);
-  for (let i = 0; i < D.x.length; i++) {
-    const e = (D.x[i] - sat * D.x0h[i]) / s1at;
-    D.x[i] = c0 * D.x0h[i] + ce * e + (sig > 1e-6 ? sig * gauss(D.rng) : 0);
+/* The visible rally runs in real time; practice runs as fast as the frame budget allows */
+function pgUpdate(D, dt, S) {
+  D.fade = Math.min(1, D.fade + dt * PG.FADE);
+  const n = Math.min(40, Math.round(dt * PG.RATE));
+  for (let i = 0; i < n && D.steps < PG.MAXSTEP; i++) pgPractice(D);
+  /* The rally runs on the real clock in small sub-steps, so it is smooth at any frame rate */
+  const e = D.demo;
+  D.acc = Math.min(0.12, D.acc + dt);
+  while (D.acc >= PG.DT) {
+    D.acc -= PG.DT;
+    if (D.sub % PG.SKIP === 0) {
+      D.act = pgFwd(D.net, pgObs(e));
+      D.a = D.rng() < PG.EPS_SHOW ? Math.floor(D.rng() * 3) : pgArg(D.act.q);
+      D.trail.push([e.bx, e.by]);
+      if (D.trail.length > 12) D.trail.shift();
+      D.imp = pgImpact(e);
+    }
+    D.sub++;
+    const r = pgStep(e, D.a);
+    if (r > 0) D.flash = 1;
+    if (r < 0) D.flash = -1;
   }
-  D.k++;
-  D.dirty = true;
-}
-function dfForward(D) {
-  const ut = 1 - D.k / DF.STEPS, us = 1 - (D.k - 1) / DF.STEPS;
-  const r = dfAbar(us) / dfAbar(ut), c0 = Math.sqrt(r), cn = Math.sqrt(Math.max(0, 1 - r));
-  for (let i = 0; i < D.x.length; i++) D.x[i] = c0 * D.x[i] + cn * gauss(D.rng);
-  D.k--;
-  D.dirty = true;
-}
-function dfFlush(D) {
-  if (!D.dirty) return;
-  const d = D.img.data;
-  for (let i = 0, j = 0; j < D.x.length; i += 4, j += 3) {
-    const y = D.x[j], cb = D.x[j + 1] * DF.CH, cr = D.x[j + 2] * DF.CH;
-    d[i] = (y + 1.403 * cr + 1) * 127.5; d[i + 1] = (y - 0.344 * cb - 0.714 * cr + 1) * 127.5; d[i + 2] = (y + 1.773 * cb + 1) * 127.5; d[i + 3] = 255;
-  }
-  D.cv.getContext("2d").putImageData(D.img, 0, 0);
-  D.dirty = false;
-}
-function dfSnap(D) {
-  const idx = Math.round((D.k / DF.STEPS) * (DF.SNAP - 1));
-  if (Math.abs((idx / (DF.SNAP - 1)) * DF.STEPS - D.k) > 0.5 || D.thumbs[idx].filled) return;
-  dfFlush(D);
-  const tc = D.thumbs[idx].cv.getContext("2d");
-  tc.clearRect(0, 0, DF.W, DF.H); tc.drawImage(D.cv, 0, 0);
-  D.thumbs[idx].filled = true;
-}
-function dfHud(D) {
-  const lab = D.phase === 2 ? "Diffusion · adding noise" : "Diffusion · denoising step " + Math.round((1000 * D.k) / DF.STEPS) + " / 1000";
-  hudSet(lab, D.hist);
-}
-function dfUpdate(D, dt, S) {
-  D.fade = Math.min(1, D.fade + dt * 1.4);
-  if (D.phase === 1) {
+  /* Ease the drawn paddles, so bang-bang control does not read as twitching */
+  const sm = 1 - Math.exp(-dt * 26);
+  D.pyShow += (e.py - D.pyShow) * sm;
+  D.oyShow += (e.oy - D.oyShow) * sm;
+  if (D.flash) { D.flash *= Math.exp(-dt * 4); if (Math.abs(D.flash) < 0.02) D.flash = 0; }
+  /* Once it has the game, let the rally run a while, then start over from random weights */
+  if (D.good >= 2 || D.steps >= PG.MAXSTEP) {
     D.hold += dt;
-    if (D.hold > DF.HOLD) { D.phase = 2; D.acc = 0; dfHud(D); }
-    return;
+    if (D.hold > PG.HOLD) { S.seed++; S.D = pgNew(S.seed); }
   }
-  D.acc += dt * DF.RATE * (D.phase === 2 ? 2.2 : 1);
-  while (D.acc >= 1) {
-    D.acc -= 1;
-    if (D.phase === 0) {
-      dfReverse(D); dfSnap(D);
-      if (D.k % 3 === 0) { D.hist.push(D.k / DF.STEPS); if (D.hist.length > 40) D.hist.shift(); }
-      if (D.k >= DF.STEPS) { D.phase = 1; D.hold = 0; break; }
-    } else {
-      dfForward(D);
-      if (D.k <= 0) { S.seed++; dfLoad(D, S.seed); D.phase = 0; D.k = 0; dfSnap(D); break; }
+}
+function pgLayout(w, h, D) {
+  /* Stack the panel under the court only on phones; on a short laptop window the court needs the width */
+  const sp = heroSpace(h), availH = sp.bottom - sp.top, narrow = w < 620, maxW = w * (narrow ? 0.92 : 0.84);
+  const netW = narrow ? Math.min(maxW * 0.8, 300) : Math.min(260, Math.max(132, maxW * 0.26));
+  let nodeGap = Math.max(5, Math.min(narrow ? 8.5 : 10, (availH * (narrow ? 0.45 : 0.8) - 26) / (PG.H - 1)));
+  let netH = (PG.H - 1) * nodeGap + 26;
+  const curveH = narrow ? 34 : 44, gap = narrow ? 22 : Math.max(26, w * 0.03), lab = 16;
+  let courtW, courtH;
+  if (narrow) {
+    courtW = maxW;
+    courtH = Math.max(90, Math.min(courtW / 1.5, availH * 0.45));
+    courtW = Math.min(maxW, courtH * 1.5);
+  } else {
+    courtW = maxW - netW - gap;
+    courtH = Math.max(110, Math.min(courtW / 1.5, availH - curveH - lab * 2 - 18));
+    courtW = courtH * 1.5;
+  }
+  if (narrow) {
+    nodeGap = Math.max(5, Math.min(nodeGap, (availH - courtH - lab - curveH - gap - 12 - 26) / (PG.H - 1)));
+    netH = (PG.H - 1) * nodeGap + 26;
+  }
+  const blockW = narrow ? Math.max(courtW, netW) : courtW + gap + netW;
+  const block = narrow ? courtH + lab + curveH + gap + netH : Math.max(courtH + lab + curveH, netH);
+  const left = (w - blockW) / 2, top = sp.top + Math.max(0, (availH - block) / 2);
+  const cx = narrow ? left + (blockW - courtW) / 2 : left;
+  return {
+    narrow, courtW, courtH, netW, netH, curveH, nodeGap, left, top, cx, cy: top,
+    curveY: top + courtH + lab,
+    netX: narrow ? left + (blockW - netW) / 2 : left + courtW + gap,
+    netY: narrow ? top + courtH + lab + curveH + gap : top + Math.max(0, (courtH + lab + curveH - netH) / 2),
+    fz: narrow ? 10 : 11.5
+  };
+}
+function pgRender(ctx, w, h, D) {
+  const F = D.fade;
+  if (F <= 0) return;
+  const G = pgLayout(w, h, D), e = D.demo;
+  const X = (u) => G.cx + u * G.courtW, Y = (v) => G.cy + v * G.courtH;
+
+  /* The court */
+  ctx.strokeStyle = rgba("rule-2", F);
+  ctx.lineWidth = 1;
+  ctx.strokeRect(G.cx + 0.5, G.cy + 0.5, G.courtW - 1, G.courtH - 1);
+  ctx.setLineDash([3, 7]);
+  ctx.strokeStyle = rgba("rule", F);
+  ctx.beginPath();
+  ctx.moveTo(X(0.5), Y(0));
+  ctx.lineTo(X(0.5), Y(1));
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  /* The ball's path to the agent's wall, bounces included: the answer, before the paddle moves */
+  if (D.imp && D.imp.pts.length > 1) {
+    ctx.setLineDash([2, 5]);
+    ctx.strokeStyle = rgba("blue", 0.5 * F);
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    D.imp.pts.forEach((p, i) => (i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1]))));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    const iy = Y(D.imp.y);
+    ctx.beginPath();
+    ctx.moveTo(X(0.96) - 5, iy);
+    ctx.lineTo(X(0.96) + 5, iy);
+    ctx.strokeStyle = rgba("blue", 0.8 * F);
+    ctx.stroke();
+  }
+
+  /* Ball, with a short trail */
+  D.trail.forEach((p, i) => {
+    const a = ((i + 1) / D.trail.length) * 0.4 * F;
+    ctx.fillStyle = rgba("blue", a);
+    ctx.beginPath();
+    ctx.arc(X(p[0]), Y(p[1]), 2.2, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.fillStyle = rgba("chalk", F);
+  ctx.beginPath();
+  ctx.arc(X(e.bx), Y(e.by), 3.1, 0, Math.PI * 2);
+  ctx.fill();
+
+  /* Paddles: the agent on the right in gold, the scripted tracker on the left */
+  const pw = Math.max(3, G.courtW * 0.012), ph = PG.PH * G.courtH;
+  ctx.fillStyle = rgba("chalk", 0.8 * F);
+  ctx.fillRect(X(0.035) - pw / 2, Y(D.oyShow) - ph / 2, pw, ph);
+  ctx.fillStyle = rgba("gold", F);
+  ctx.fillRect(X(0.965) - pw / 2, Y(D.pyShow) - ph / 2, pw, ph);
+  if (D.flash) {
+    ctx.strokeStyle = rgba(D.flash > 0 ? "gold" : "dust", Math.abs(D.flash) * 0.8 * F);
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(X(0.965) - pw * 1.6, Y(D.pyShow) - ph / 2 - pw, pw * 3.2, ph + pw * 2);
+  }
+
+  /* Training curve: share of balls returned, per block of practice steps */
+  const cv = D.curve, cw = G.courtW, cy0 = G.curveY, chh = G.curveH;
+  ctx.strokeStyle = rgba("rule", F);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(G.cx, cy0 + chh);
+  ctx.lineTo(G.cx + cw, cy0 + chh);
+  ctx.stroke();
+  if (cv.length > 1) {
+    ctx.beginPath();
+    cv.forEach((v, i) => {
+      const x = G.cx + (i / (PG.CURVE - 1)) * cw, y = cy0 + chh - clamp01(v) * chh;
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.strokeStyle = rgba("gold", 0.9 * F);
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+    const lx = G.cx + ((cv.length - 1) / (PG.CURVE - 1)) * cw, ly = cy0 + chh - clamp01(cv[cv.length - 1]) * chh;
+    ctx.beginPath();
+    ctx.arc(lx, ly, 2.4, 0, Math.PI * 2);
+    ctx.fillStyle = rgba("gold", F);
+    ctx.fill();
+  }
+  text(ctx, "returns", G.cx, cy0 + chh + G.fz + 3, MATH(G.fz), rgba("fog", 0.9 * F));
+  text(ctx, "ε " + D.eps.toFixed(2), G.cx + cw, cy0 + chh + G.fz + 3, MATH(G.fz), rgba("dust", 0.9 * F), "right");
+
+  /* The network: inputs, 20 tanh units, three Q-values. Edge weight sets line weight. */
+  const act = D.act, nx = G.netX, ny = G.netY, barMax = G.netW * 0.28, colGap = (G.netW - 30 - barMax) / 2;
+  const iy = (k) => ny + 13 + ((PG.H - 1) * G.nodeGap * k) / (PG.IN - 1);
+  const hy = (k) => ny + 13 + k * G.nodeGap;
+  const oy = (k) => ny + 13 + (PG.H - 1) * G.nodeGap * (0.18 + 0.32 * k);
+  const ix = nx + 8, hx = nx + 8 + colGap, ox = nx + 8 + colGap * 2;
+  let mx1 = 1e-6, mx2 = 1e-6;
+  for (let i = 0; i < PG.H; i++) for (let j = 0; j < PG.IN; j++) mx1 = Math.max(mx1, Math.abs(D.net.w1[i][j]));
+  for (let k = 0; k < PG.OUT; k++) for (let i = 0; i < PG.H; i++) mx2 = Math.max(mx2, Math.abs(D.net.w2[k][i]));
+  for (let i = 0; i < PG.H; i++) {
+    for (let j = 0; j < PG.IN; j++) {
+      const wv = D.net.w1[i][j], m = Math.abs(wv) / mx1;
+      if (m < 0.12) continue;
+      ctx.strokeStyle = rgba(wv > 0 ? "blue" : "teal", (0.1 + 0.4 * m * m) * F);
+      ctx.lineWidth = 0.4 + 1.1 * m;
+      ctx.beginPath();
+      ctx.moveTo(ix + 3, iy(j));
+      ctx.lineTo(hx - 3, hy(i));
+      ctx.stroke();
     }
   }
-  dfHud(D);
-}
-function dfRender(ctx, w, h, D) {
-  const A = D.fade;
-  if (A <= 0) return;
-  dfFlush(D);
-  const narrow = w < 700, N = DF.SNAP, ratio = DF.W / DF.H;
-  const sp = heroSpace(h), availH = sp.bottom - sp.top;
-  const fw = Math.min(w * (narrow ? 0.86 : 0.42), ((availH - 18) * ratio) / 1.24), fh = fw / ratio;
-  const tg = fw * 0.02, tw = (fw - (N - 1) * tg) / N, th = tw / ratio, gap = fh * 0.07, lab = 18;
-  const total = fh + gap + th + lab, top = sp.top + Math.max(0, (availH - total) / 2), left = (w - fw) / 2;
-  ctx.save();
-  ctx.globalAlpha = A;
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(D.cv, left, top, fw, fh);
-  ctx.strokeStyle = rgba("rule-2", 1); ctx.lineWidth = 1;
-  ctx.strokeRect(left - 0.5, top - 0.5, fw + 1, fh + 1);
-  const ty = top + fh + gap;
-  D.thumbs.forEach((t, i) => {
-    const x = left + i * (tw + tg);
-    if (t.filled) ctx.drawImage(t.cv, x, ty, tw, th);
-    ctx.strokeStyle = rgba(t.filled ? "rule-2" : "rule", 1);
-    ctx.strokeRect(x - 0.5, ty - 0.5, tw + 1, th + 1);
-  });
-  ctx.restore();
-  const ly = ty + th + 15, fz = narrow ? 12 : 13;
-  text(ctx, "pure noise", left, ly, MATH(fz), rgba("fog", A), "left");
-  text(ctx, "image", left + fw, ly, MATH(fz), rgba("fog", A), "right");
-  ctx.font = MATH(fz);
-  const x1 = left + ctx.measureText("pure noise").width + 10, x2 = left + fw - ctx.measureText("image").width - 10, yy = ly - fz * 0.32;
-  ctx.strokeStyle = rgba("dust", A); ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(x1, yy); ctx.lineTo(x2, yy); ctx.moveTo(x2, yy); ctx.lineTo(x2 - 5, yy - 3); ctx.moveTo(x2, yy); ctx.lineTo(x2 - 5, yy + 3); ctx.stroke();
-  const prog = D.phase === 0 ? D.k / DF.STEPS : D.phase === 1 ? 1 : D.k / DF.STEPS;
-  if (D.phase !== 2) {
-    const px = x1 + (x2 - x1) * prog;
-    ctx.beginPath(); ctx.arc(px, yy, 3, 0, Math.PI * 2); ctx.fillStyle = rgba("gold", A); ctx.fill();
+  for (let k = 0; k < PG.OUT; k++) {
+    for (let i = 0; i < PG.H; i++) {
+      const wv = D.net.w2[k][i], m = Math.abs(wv) / mx2;
+      if (m < 0.12) continue;
+      ctx.strokeStyle = rgba(wv > 0 ? "blue" : "teal", (0.1 + 0.4 * m * m) * F);
+      ctx.lineWidth = 0.4 + 1.1 * m;
+      ctx.beginPath();
+      ctx.moveTo(hx + 3, hy(i));
+      ctx.lineTo(ox - 3, oy(k));
+      ctx.stroke();
+    }
   }
+  const dot = (x, y, r, v, col) => {
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = rgba(col, (0.12 + 0.8 * clamp01(Math.abs(v))) * F);
+    ctx.fill();
+    ctx.strokeStyle = rgba("rule-2", F);
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+  };
+  const INL = ["x", "y", "ẋ", "ẏ", "p", "Δ", "î"];
+  for (let j = 0; j < PG.IN; j++) {
+    const v = act ? act.x[j] : 0;
+    dot(ix, iy(j), 3, v, v >= 0 ? "blue" : "teal");
+    text(ctx, INL[j], ix - 7, iy(j) + 3, MATH(G.fz), rgba("dust", F), "right");
+  }
+  for (let i = 0; i < PG.H; i++) dot(hx, hy(i), 2.6, act ? act.h[i] : 0, act && act.h[i] < 0 ? "teal" : "blue");
+  const q = act ? act.q : [0, 0, 0], best = pgArg(q), lo = Math.min(...q), hi = Math.max(...q), span = Math.max(0.25, hi - lo);
+  const OUTL = ["↑", "·", "↓"];
+  for (let k = 0; k < PG.OUT; k++) {
+    const on = k === (D.a == null ? best : D.a);
+    dot(ox, oy(k), 3.4, 0.4 + 0.6 * ((q[k] - lo) / span), on ? "gold" : "blue");
+    text(ctx, OUTL[k], ox + 9, oy(k) + 3.5, SANS(G.fz + 1), rgba(on ? "gold" : "fog", F));
+    const bw = ((q[k] - lo) / span) * barMax;
+    ctx.fillStyle = rgba(k === best ? "gold" : "blue", (k === best ? 0.85 : 0.45) * F);
+    ctx.fillRect(ox + 18, oy(k) - 2.5, Math.max(1, bw), 5);
+  }
+  text(ctx, "Q", ox + 18, ny + 4, MATH(G.fz), rgba("fog", 0.9 * F));
 }
-function sceneDF(ctx, w, h, dt, S) {
+function scenePG(ctx, w, h, dt, S) {
   if (!S.D) {
-    S.D = dfNew(S.seed);
-    if (REDUCED) { S.D.fade = 1; while (S.D.k < DF.STEPS) { dfReverse(S.D); dfSnap(S.D); } S.D.phase = 1; }
-    dfHud(S.D);
+    S.D = pgNew(S.seed);
+    if (REDUCED) {
+      S.D.fade = 1;
+      for (let i = 0; i < 2600; i++) pgPractice(S.D);
+      for (let i = 0; i < 120; i++) {
+        S.D.act = pgFwd(S.D.net, pgObs(S.D.demo));
+        S.D.a = pgArg(S.D.act.q);
+        for (let k = 0; k < PG.SKIP; k++) pgStep(S.D.demo, S.D.a);
+        S.D.trail.push([S.D.demo.bx, S.D.demo.by]);
+        if (S.D.trail.length > 12) S.D.trail.shift();
+      }
+      S.D.imp = pgImpact(S.D.demo);
+      S.D.pyShow = S.D.demo.py;
+      S.D.oyShow = S.D.demo.oy;
+    }
   }
-  if (!REDUCED) dfUpdate(S.D, dt, S);
-  dfRender(ctx, w, h, S.D);
+  if (!REDUCED) pgUpdate(S.D, dt, S);
+  pgRender(ctx, w, h, S.D);
 }
 
 function sceneQL(ctx, w, h, dt, S) {
@@ -1594,7 +1770,7 @@ function heroSpace(h) {
 }
 
 /* One scene per visit, never the same one twice in a row */
-const HERO_SCENES = { ql: sceneQL, az: sceneAZ, df: sceneDF };
+const HERO_SCENES = { ql: sceneQL, az: sceneAZ, pg: scenePG };
 function pickHeroScene() {
   const keys = Object.keys(HERO_SCENES);
   let forced = null, last = null;
@@ -2092,7 +2268,10 @@ function frame(now) {
   last = now;
   if (!REDUCED && hero.visible && !sheet.open) {
     hero.t += dt; heroAcc += dt;
-    if (heroAcc >= 1 / 30) { heroAcc = 0; hero.render(); }
+    /* Pong is a live game, so it gets 60 fps; the others stay at 30. Keep the leftover time
+       instead of dropping it, otherwise the render interval jitters and the motion stutters. */
+    const step = hero.S.key === "pg" ? 1 / 60 : 1 / 30;
+    if (heroAcc >= step) { heroAcc = Math.min(heroAcc - step, step); hero.render(); }
   }
   active.forEach((v) => {
     v.step(dt); v.render();
